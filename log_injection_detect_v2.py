@@ -1,106 +1,115 @@
 #!/usr/bin/env python3
 """
-Purpose: the log only records lines in the following format:
+Log injection detector v2.
+
+Idea: the application only ever writes ONE kind of line:
     [YYYY-MM-DD HH:MM:SS] Login attempt: <username>
-    Anything that doesn't fit the above format is evidence of tampering.
+so anything that does not fit that format, or that looks odd inside it,
+is evidence of tampering. This is an allow-list approach instead of
+searching for individual bad strings.
 
 Usage: python3 log_injection_detect_v2.py [logfile]
-""" 
+"""
 
-# imports
 import os
 import re
 import sys
 from datetime import datetime
 
-TIMESTAMP = r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]"
-VALID_LINE =  re.compile(rf"^({TIMESTAMP}) Login attempt: (.*)$")
-TIMESTAMP_ONLY =  re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
-SUSPICIOUS_IN_USERNAME = re.compile(r"\[|\]|fake|deleted|admin (login|action)|%0a|%0d|\\n|\\r", re.IGNORECASE)
+TS = r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]"
+VALID_LINE = re.compile(rf"^(\[[^\]]+\]) Login attempt: (.*)$")
+TS_ONLY = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
+SUSPICIOUS_IN_USERNAME = re.compile(
+    r"\[|\]|fake|deleted|admin (login|action)|%0a|%0d|\\n|\\r", re.IGNORECASE
+)
 
-def analyze_log(log_file):
-    # check if log file exists
-    if not os.path.exists(log_file):
-        print(f"File not found: {log_file}")
+
+def analyze(path):
+    if not os.path.exists(path):
+        print(f"File not found: {path}")
         return 1
 
-    # open log file
-    with open(log_file, "r") as f: 
+    with open(path, "r") as f:
         lines = f.read().splitlines()
 
-    suspicious = [] # format: (line_no, reason, text)
-    latest_timestamp = None # used to record the latest timestamp
+    findings = []  # (line_no, severity, reason, text)
+    latest = None  # latest timestamp seen so far
 
-    for i, line in enumerate(lines, 1):
-        # 1. Blank line - a legitimate log never produces a blank line
+    for n, line in enumerate(lines, 1):
+        # 1. Blank line: a legitimate write never produces one
         if line.strip() == "":
-            suspicious.append((i, "Blank line: possible injected newline", line))
+            findings.append((n, "HIGH", "Blank line (possible injected newline)", line))
             continue
 
-        # 2. multiple timestamps on a single line
-        if len(re.findall(TIMESTAMP, line)) > 1:
-            suspicious.append((i, "Multiple timestamps on one line", line))
+        # 2. More than one timestamp on a single line
+        if len(re.findall(TS, line)) > 1:
+            findings.append((n, "HIGH", "Multiple timestamps on one line", line))
 
-        match_line = VALID_LINE.match(line)
+        m = VALID_LINE.match(line)
 
-        # 3. Line does not match the format the app writes
-        if not match_line: 
-            # only timestamps
-            if TIMESTAMP_ONLY.match(line):
-                    suspicious.append((i, "Timestamped line that is not a login attempt", line))
-            # line without a timestamp
+        # 3. Line does not match the format the app writes (orphan / forged line)
+        if not m:
+            if TS_ONLY.match(line):
+                findings.append(
+                    (n, "HIGH", "Timestamped line that is not a login attempt "
+                                "(app never writes this; forged entry)", line)
+                )
             else:
-                suspicious.append((i, "Line with no timestamp", line))
-        else: 
-             # get username of each line
-            username = match_line.group(2)
-            # 4. check if username is empty
+                findings.append(
+                    (n, "HIGH", "Line with no timestamp (orphan line, "
+                                "injected via newline)", line)
+                )
+            # still check timestamp order below if there is one
+        else:
+           
+            username = m.group(2)
+            # 4. Empty username
             if username.strip() == "":
-                suspicious.append((i, "log with empty username", line))
-            # 5. suspicious content inside username
+                findings.append((n, "LOW", "Empty username", line))
+            # 5. Suspicious content inside the username field
             elif SUSPICIOUS_IN_USERNAME.search(username):
-                suspicious.append((i, "Suspicious content inside username", line))
+                findings.append(
+                    (n, "MEDIUM", "Suspicious content inside username "
+                                  "(attempted injection, may have been neutralised)", line)
+                )
 
-        # 6. timestamps must not go backwards in time
-        match_timestamp = TIMESTAMP_ONLY.match(line)
-
-        if match_timestamp:
-            get_timestamp = datetime.strptime(match_timestamp.group(1), "%Y-%m-%d %H:%M:%S")
-            if latest_timestamp and get_timestamp < latest_timestamp:
-                suspicious.append((i, f"Timestamp goes backwards (earlier than {latest_timestamp})", line))
+        # 6. Timestamps must not go backwards in an append-only log
+        t = TS_ONLY.match(line)
+        if t:
+            ts = datetime.strptime(t.group(1), "%Y-%m-%d %H:%M:%S")
+            if latest and ts < latest:
+                findings.append(
+                    (n, "HIGH", f"Timestamp goes backwards (earlier than {latest}); "
+                                "likely forged/backdated entry", line)
+                )
             else:
-                latest_timestamp = get_timestamp 
+                latest = ts
 
-    # analysis report
-    print("=" * 65)
-    print(f"LOG ANALYSIS: {log_file}")
-    print("=" * 65)
-    print(f"\n* Statistics:")
-    print(f"   Total lines: {len(lines)}")
-    print(f"   File size: {os.path.getsize(log_file)} bytes")
+    # ---- report ----
+    print("=" * 60)
+    print(f"LOG ANALYSIS v2: {path}")
+    print("=" * 60)
+    print(f"Total lines: {len(lines)}   File size: {os.path.getsize(path)} bytes")
 
-
-    if not suspicious:
-        print("\nNo suspicious entries found")
-        print("=" * 50)
+    if not findings:
+        print("\nNo anomalies found.")
+        print("=" * 60)
         return 0
 
-    suspicious.sort(key=lambda x: x[0])
-    print(f"\nFound {len(suspicious)} suspicious entries:\n")
-    for i, reason, text in suspicious:
-        if text:
-            shown = text 
-        else: 
-            shown = "empty line"
-        print(f"Line {i:>3} {reason}")
-        print(f"        * {shown[:90]}")
-    print("=" * 65)
+    findings.sort(key=lambda x: x[0])
+    counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    print(f"\nFound {len(findings)} findings:\n")
+    for n, sev, reason, text in findings:
+        counts[sev] += 1
+        shown = text if text else "(empty line)"
+        print(f"  Line {n:>3} [{sev}] {reason}")
+        print(f"           > {shown[:90]}")
+    print(f"\nSummary: {counts['HIGH']} high, {counts['MEDIUM']} medium, "
+          f"{counts['LOW']} low")
+    print("=" * 60)
     return 2
 
-if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        log_file = sys.argv[1] 
-    else:
-        log_file = "access.log"
 
-    analyze_log(log_file)
+if __name__ == "__main__":
+    target = sys.argv[1] if len(sys.argv) > 1 else "c:/uni/s2/ISEC3004/ISEC3004_Assignment/Vulnerabilities Log Injection/access.log"
+    sys.exit(analyze(target))
